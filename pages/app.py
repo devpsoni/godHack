@@ -1,5 +1,6 @@
 import streamlit as st
 import cohere
+import google.generativeai as genai
 import sqlite3
 import hashlib
 import uuid
@@ -14,10 +15,19 @@ if 'messages' not in st.session_state:
     st.session_state.messages = []
 if 'current_chat_id' not in st.session_state:
     st.session_state.current_chat_id = None
+if 'context' not in st.session_state:
+    st.session_state.context = None
 
 @dataclass
 class CONFIG:
-    COHERE_API_KEY = get_api_key_from_trusted_source(trusted=True)
+    API_KEYS = get_api_key_from_trusted_source(trusted=True)
+    COHERE_API_KEY = API_KEYS["COHERE_API_KEY"]
+    GEMINI_API_KEY = API_KEYS["GEMINI_API_KEY"]
+    
+# Initialize Gemini
+genai.configure(api_key=CONFIG.GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel('gemini-pro')
+
 
 # Database setup
 conn = sqlite3.connect('user_data.db')
@@ -38,6 +48,14 @@ def cohere_output_generation(question, context):
     )
     return response.generations[0].text.strip()
 
+def gemini_output_generation(messages):
+    chat = gemini_model.start_chat(history=[])
+    for message in messages:
+        if message["role"] == "user":
+            chat.send_message(message["content"])
+    response = chat.send_message(messages[-1]["content"])
+    return response.text
+
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
@@ -55,20 +73,22 @@ def login(username, password):
     c.execute("SELECT * FROM users WHERE username=? AND password=?", (username, hashed_password))
     return c.fetchone() is not None
 
-def save_chat(username, title, messages):
+def save_chat(username, title, messages, context):
     chat_id = str(uuid.uuid4())
-    c.execute("INSERT INTO chats VALUES (?, ?, ?, ?)", (chat_id, username, title, str(messages)))
+    c.execute("INSERT INTO chats VALUES (?, ?, ?, ?, ?)", (chat_id, username, title, str(messages), context))
     conn.commit()
     return chat_id
+
 
 def get_user_chats(username):
     c.execute("SELECT id, title FROM chats WHERE username=?", (username,))
     return c.fetchall()
 
 def get_chat_messages(chat_id):
-    c.execute("SELECT messages FROM chats WHERE id=?", (chat_id,))
+    c.execute("SELECT messages, context FROM chats WHERE id=?", (chat_id,))
     result = c.fetchone()
-    return eval(result[0]) if result else []
+    return eval(result[0]), result[1] if result else [], None
+
 
 # Set page config
 st.set_page_config(layout="wide", page_title="Barnaby - AI Research Assistant")
@@ -142,6 +162,7 @@ if not st.session_state.user:
             else:
                 st.error("Username already exists.")
 
+# Main content for logged-in users
 else:
     # Sidebar for logged-in users
     with st.sidebar:
@@ -153,18 +174,20 @@ else:
         if st.button("New Chat", key="new_chat_button"):
             st.session_state.messages = []
             st.session_state.current_chat_id = None
+            st.session_state.context = None
         
         st.subheader("Your Chats")
         chats = get_user_chats(st.session_state.user)
         for chat_id, title in chats:
             if st.button(title, key=f"chat_{chat_id}"):
-                st.session_state.messages = get_chat_messages(chat_id)
+                st.session_state.messages, st.session_state.context = get_chat_messages(chat_id)
                 st.session_state.current_chat_id = chat_id
         
         if st.button("Logout", key="logout_button"):
             st.session_state.user = None
             st.session_state.messages = []
             st.session_state.current_chat_id = None
+            st.session_state.context = None
             st.experimental_rerun()
 
     # Main chat interface
@@ -179,22 +202,14 @@ else:
             elif file_type == "pptx":
                 context = extract_text_from_ppt(uploaded_file)
             
+            st.session_state.context = context
             st.session_state.messages = [{
                 "role": "assistant",
-                "content": f"""Hey there! You've uploaded {uploaded_file.name}.
-
-Barnaby can help you analyze this document in several ways:
-
-1. Extract key information
-2. Summarize content
-3. Answer specific questions
-4. Identify main themes or topics
-
-What would you like to know about this document?"""
+                "content": f"Hey there! You've uploaded {uploaded_file.name}. What would you like to know about this document?"
             }]
             
             chat_title = f"Chat about {uploaded_file.name}"
-            st.session_state.current_chat_id = save_chat(st.session_state.user, chat_title, st.session_state.messages)
+            st.session_state.current_chat_id = save_chat(st.session_state.user, chat_title, st.session_state.messages, context)
         except Exception as e:
             st.error(f"An error occurred while processing the file: {str(e)}")
 
@@ -205,25 +220,25 @@ What would you like to know about this document?"""
                 st.write(message["content"])
 
     # Chat input
-    if prompt := st.chat_input("Ask a question about the document:"):
+    if prompt := st.chat_input("Ask a question:"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.write(prompt)
 
-        if 'context' in locals():
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    response = cohere_output_generation(prompt, context)
-                st.write(response)
-                st.session_state.messages.append({"role": "assistant", "content": response})
-            
-            # Save updated chat
-            if st.session_state.current_chat_id:
-                c.execute("UPDATE chats SET messages=? WHERE id=?", (str(st.session_state.messages), st.session_state.current_chat_id))
-                conn.commit()
-        else:
-            with st.chat_message("assistant"):
-                st.write("Please upload a document before asking questions.")
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                if st.session_state.context:
+                    # Use Cohere API for document-related queries
+                    response = cohere_output_generation(prompt, st.session_state.context)
+                else:
+                    # Use Gemini API for general conversations
+                    response = gemini_output_generation(st.session_state.messages)
+            st.write(response)
+            st.session_state.messages.append({"role": "assistant", "content": response})
+        
+        # Save updated chat
+        if st.session_state.current_chat_id:
+            c.execute("UPDATE chats SET messages=? WHERE id=?", (str(st.session_state.messages), st.session_state.current_chat_id))
+            conn.commit()
 
-    st.markdown("---")
-    st.caption("For the free version, we only provide you with the ability to upload files less than 1000 pages for business purposes. Contact us at barnaby@example.com")
+    

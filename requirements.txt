@@ -5,3 +5,4 @@ python-docx==0.8.11
 python-pptx==0.6.21
 sqlite3==2.6.0
 uuid==1.30
+google-generativeai==0.3.1
